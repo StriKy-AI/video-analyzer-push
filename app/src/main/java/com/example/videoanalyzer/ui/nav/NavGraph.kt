@@ -97,6 +97,11 @@ fun AppNavHost() {
         composable(Routes.HOME) {
             HomeScreen(
                 onOpenSettings = { navController.navigate(Routes.SETTINGS) },
+                onResetSetup = {
+                    navController.navigate(Routes.SETUP) {
+                        popUpTo(Routes.HOME) { inclusive = true }
+                    }
+                },
             )
         }
         composable(Routes.SETTINGS) {
