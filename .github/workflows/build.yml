@@ -1,0 +1,74 @@
+name: Build Android APK
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: write   # needed for creating GitHub Releases
+
+jobs:
+  build:
+    name: Build APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          # Cache Gradle and AGP state between runs to keep builds fast.
+          cache-read-only: ${{ github.ref != 'refs/heads/main' }}
+
+      - name: Generate gradlew / gradle-wrapper.jar if missing
+        # We intentionally don't ship gradlew.bat or gradle-wrapper.jar in git
+        # (the JAR is binary, ~60 KB). The first CI run generates them with
+        # the system Gradle installed by the step above; subsequent runs reuse
+        # the committed wrapper.
+        run: |
+          if [ ! -x ./gradlew ] || [ ! -f ./gradle/wrapper/gradle-wrapper.jar ]; then
+            gradle wrapper --gradle-version 8.7
+            chmod +x ./gradlew
+          fi
+
+      - name: Build debug APK
+        run: ./gradlew --no-daemon assembleDebug
+
+      - name: Build release APK (signed with debug key — installable for personal use)
+        run: ./gradlew --no-daemon assembleRelease
+
+      - name: Locate APKs
+        id: apk
+        run: |
+          set -e
+          mkdir -p dist
+          find app/build/outputs/apk -name "*.apk" -print -exec cp {} dist/ \;
+          ls -la dist
+
+      - name: Upload APKs as workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: video-analyzer-apk
+          path: dist/*.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Create GitHub Release (only on tag push)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.apk
+          generate_release_notes: true
+          fail_on_unmatched_files: true
