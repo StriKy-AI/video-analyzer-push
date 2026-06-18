@@ -1,14 +1,18 @@
 package com.example.videoanalyzer.network
 
+import com.squareup.moshi.Json
 import com.squareup.moshi.JsonClass
 
 /**
  * Request body for the OpenAI-compatible chat completions endpoint, extended
- * with a `video_url` content part. Providers like Moonshot Kimi accept this
- * shape directly; others that only support image input can be supported by
- * extracting frames instead.
+ * with a `video_url` content part for providers like Moonshot Kimi that accept
+ * native video input.
  *
- * Use [VideoContentPart] to attach the video as a base64 data URL.
+ * Note: [ContentPart] is intentionally a flat data class (not a sealed class)
+ * because Moshi's reflection adapter cannot serialize sealed-class hierarchies
+ * out of the box — and `MoshiConverterFactory` would fail at request-build time
+ * with "Unable to create @Body converter". Using a flat shape also matches the
+ * wire format used by the providers we're targeting.
  */
 @JsonClass(generateAdapter = false)
 data class ChatCompletionRequest(
@@ -24,24 +28,29 @@ data class ChatMessage(
     val content: List<ContentPart>,
 )
 
-sealed class ContentPart
-data class TextPart(val text: String) : ContentPart() {
-    val type: String get() = "text"
-}
+/**
+ * Single content-part shape used by OpenAI-style chat completions. Use [type]
+ * as the discriminator and fill exactly one of the payload fields:
+ *
+ *   - `type = "text"`      → fill [text]
+ *   - `type = "image_url"` → fill [imageUrl]
+ *   - `type = "video_url"` → fill [videoUrl]
+ *
+ * Moshi's default serialization omits null fields, so the JSON for a text part
+ * is exactly `{"type": "text", "text": "..."}` — no trailing nulls.
+ */
+@JsonClass(generateAdapter = false)
+data class ContentPart(
+    val type: String,
+    val text: String? = null,
+    @Json(name = "image_url") val imageUrl: ImageUrl? = null,
+    @Json(name = "video_url") val videoUrl: VideoUrl? = null,
+)
 
-data class ImageUrlPart(
-    val image_url: ImageUrl,
-) : ContentPart() {
-    val type: String get() = "image_url"
-}
-
-data class VideoUrlPart(
-    val video_url: VideoUrl,
-) : ContentPart() {
-    val type: String get() = "video_url"
-}
-
+@JsonClass(generateAdapter = false)
 data class ImageUrl(val url: String)
+
+@JsonClass(generateAdapter = false)
 data class VideoUrl(val url: String)
 
 @JsonClass(generateAdapter = false)

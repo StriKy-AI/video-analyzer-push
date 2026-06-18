@@ -2,17 +2,16 @@ package com.example.videoanalyzer.data
 
 import android.content.Context
 import android.net.Uri
+import android.util.Log
 import com.example.videoanalyzer.network.ChatCompletionRequest
 import com.example.videoanalyzer.network.ChatCompletionsService
 import com.example.videoanalyzer.network.ChatCompletionResponse
 import com.example.videoanalyzer.network.ChatMessage
+import com.example.videoanalyzer.network.ContentPart
 import com.example.videoanalyzer.network.ImageUrl
-import com.example.videoanalyzer.network.ImageUrlPart
 import com.example.videoanalyzer.network.NetworkModule
 import com.example.videoanalyzer.network.OpenAiCompatibleService
-import com.example.videoanalyzer.network.TextPart
 import com.example.videoanalyzer.network.VideoUrl
-import com.example.videoanalyzer.network.VideoUrlPart
 import com.example.videoanalyzer.util.VideoUtils
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -38,14 +37,21 @@ class VideoAnalyzerRepository(
     private val openAi: OpenAiCompatibleService = NetworkModule.openAiService
     private val chat: ChatCompletionsService = NetworkModule.chatService
 
+    companion object {
+        private const val TAG = "VideoAnalyzer"
+    }
+
     /** Hit the provider's /v1/models endpoint and return the model ids. */
     suspend fun fetchModels(baseUrl: String, apiKey: String): List<String> =
         withContext(Dispatchers.IO) {
             val normalized = NetworkModule.normalizeBaseUrl(baseUrl)
             val url = "$normalized/v1/models"
             val auth = NetworkModule.bearerHeader(apiKey)
+            Log.d(TAG, "[fetchModels] GET $url")
             val resp = openAi.listModels(url, auth)
-            resp.allIds()
+            val ids = resp.allIds()
+            Log.d(TAG, "[fetchModels] returned ${ids.size} model ids")
+            ids
         }
 
     /**
@@ -72,27 +78,47 @@ class VideoAnalyzerRepository(
                 ChatMessage(
                     role = "user",
                     content = listOf(
-                        TextPart(question.ifBlank { "Describe what's happening in this video." }),
-                        VideoUrlPart(VideoUrl(dataUrl)),
+                        ContentPart(
+                            type = "text",
+                            text = question.ifBlank { "Describe what's happening in this video." },
+                        ),
+                        ContentPart(type = "video_url", videoUrl = VideoUrl(dataUrl)),
                     ),
                 ),
             ),
+        )
+
+        logRequest(
+            op = "analyzeVideo",
+            method = "POST",
+            url = url,
+            request = request,
+            videoBytes = bytes.size,
+            mime = mime,
+            model = model,
         )
 
         val response: ChatCompletionResponse = try {
             chat.chatCompletion(url, auth, body = request)
         } catch (e: retrofit2.HttpException) {
             val errorBody = e.response()?.errorBody()?.string().orEmpty()
+            Log.e(TAG, "[analyzeVideo] HTTP ${e.code()} ${e.message()} | body: $errorBody")
             throw ApiException(
                 code = e.code(),
                 message = "HTTP ${e.code()} ${e.message()}\n$errorBody",
             )
         } catch (e: IOException) {
+            Log.e(TAG, "[analyzeVideo] network error: ${e.message}", e)
             throw ApiException(code = -1, message = "Network error: ${e.message}", cause = e)
         }
 
-        response.error?.let { throw ApiException(code = -2, message = it.message) }
-        response.extractText()
+        response.error?.let {
+            Log.e(TAG, "[analyzeVideo] API error: ${it.message}")
+            throw ApiException(code = -2, message = it.message)
+        }
+        val text = response.extractText()
+        Log.d(TAG, "[analyzeVideo] ✓ received ${text.length} chars of response text")
+        text
     }
 
     /**
@@ -113,13 +139,17 @@ class VideoAnalyzerRepository(
 
         val frames = VideoUtils.extractFrames(context, videoUri, maxFrames)
         if (frames.isEmpty()) {
+            Log.w(TAG, "[analyzeVideoByFrames] no frames extracted from $videoUri")
             throw ApiException(code = -3, message = "Could not extract any frames from this video.")
         }
 
-        val parts = mutableListOf<com.example.videoanalyzer.network.ContentPart>()
-        parts += TextPart(question.ifBlank { "Describe what's happening in this video." })
+        val parts = mutableListOf<ContentPart>()
+        parts += ContentPart(
+            type = "text",
+            text = question.ifBlank { "Describe what's happening in this video." },
+        )
         frames.forEach { (dataUrl, _) ->
-            parts += ImageUrlPart(ImageUrl(dataUrl))
+            parts += ContentPart(type = "image_url", imageUrl = ImageUrl(dataUrl))
         }
 
         val request = ChatCompletionRequest(
@@ -127,9 +157,77 @@ class VideoAnalyzerRepository(
             messages = listOf(ChatMessage("user", parts)),
         )
 
-        val response = chat.chatCompletion(url, auth, body = request)
-        response.error?.let { throw ApiException(code = -2, message = it.message) }
+        logRequest(
+            op = "analyzeVideoByFrames",
+            method = "POST",
+            url = url,
+            request = request,
+            videoBytes = frames.size * 80_000, // rough estimate, not exact
+            mime = "image/jpeg",
+            model = model,
+        )
+
+        val response = try {
+            chat.chatCompletion(url, auth, body = request)
+        } catch (e: retrofit2.HttpException) {
+            val errorBody = e.response()?.errorBody()?.string().orEmpty()
+            Log.e(TAG, "[analyzeVideoByFrames] HTTP ${e.code()} | body: $errorBody")
+            throw ApiException(
+                code = e.code(),
+                message = "HTTP ${e.code()} ${e.message()}\n$errorBody",
+            )
+        } catch (e: IOException) {
+            Log.e(TAG, "[analyzeVideoByFrames] network error: ${e.message}", e)
+            throw ApiException(code = -1, message = "Network error: ${e.message}", cause = e)
+        }
+        response.error?.let {
+            Log.e(TAG, "[analyzeVideoByFrames] API error: ${it.message}")
+            throw ApiException(code = -2, message = it.message)
+        }
         response.extractText()
+    }
+
+    /**
+     * Emits a single logcat block with everything needed to diagnose an API
+     * request without dumping the multi-MB base64 payload. The body preview
+     * keeps the JSON structure but replaces the encoded video / frame blobs
+     * with `[<size> B redacted]` markers.
+     */
+    private fun logRequest(
+        op: String,
+        method: String,
+        url: String,
+        request: ChatCompletionRequest,
+        videoBytes: Int,
+        mime: String,
+        model: String,
+    ) {
+        Log.d(TAG, "[$op] ─────────── REQUEST ───────────")
+        Log.d(TAG, "[$op] method  : $method")
+        Log.d(TAG, "[$op] url     : $url")
+        Log.d(TAG, "[$op] model   : $model")
+        Log.d(TAG, "[$op] payload : $videoBytes bytes ($mime)")
+
+        val redacted = request.copy(
+            messages = request.messages.map { msg ->
+                msg.copy(
+                    content = msg.content.map { part ->
+                        when (part.type) {
+                            "video_url" -> part.copy(
+                                videoUrl = VideoUrl("data:$mime;base64,[${videoBytes}B redacted]"),
+                            )
+                            "image_url" -> part.copy(
+                                imageUrl = ImageUrl("data:image/jpeg;base64,[frame redacted]"),
+                            )
+                            else -> part
+                        }
+                    },
+                )
+            },
+        )
+        val adapter = NetworkModule.moshi.adapter(ChatCompletionRequest::class.java).lenient()
+        Log.d(TAG, "[$op] body    : ${adapter.toJson(redacted)}")
+        Log.d(TAG, "[$op] ──────────────────────────────")
     }
 
     class ApiException(
