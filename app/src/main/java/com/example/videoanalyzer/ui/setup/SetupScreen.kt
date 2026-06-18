@@ -185,7 +185,7 @@ fun SetupScreen(
                             .menuAnchor()
                             .fillMaxWidth(),
                     )
-                    androidx.compose.material3.ExposedDropdownMenu(
+                    ExposedDropdownMenu(
                         expanded = dropdownExpanded,
                         onDismissRequest = { dropdownExpanded = false },
                     ) {

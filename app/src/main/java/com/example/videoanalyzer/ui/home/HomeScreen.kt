@@ -154,7 +154,7 @@ fun HomeScreen(
                                 .menuAnchor()
                                 .fillMaxWidth(),
                         )
-                        androidx.compose.material3.ExposedDropdownMenu(
+                        ExposedDropdownMenu(
                             expanded = modelDropdownExpanded,
                             onDismissRequest = { modelDropdownExpanded = false },
                         ) {

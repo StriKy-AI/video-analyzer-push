@@ -12,7 +12,9 @@ data class ModelsResponse(
     val data: List<ModelEntry>? = null,
     val models: List<ModelEntry>? = null, // some providers use this
 ) {
-    fun allIds(): List<String> = (data ?: models).orEmpty().mapNotNull { it.id.takeIf(String::isNotBlank) }
+    fun allIds(): List<String> = (data ?: models).orEmpty().mapNotNull { entry ->
+        entry.id?.takeIf { it.isNotBlank() }
+    }
 }
 
 @JsonClass(generateAdapter = false)
