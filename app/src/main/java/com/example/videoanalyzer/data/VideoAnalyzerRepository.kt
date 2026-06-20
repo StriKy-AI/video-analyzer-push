@@ -39,6 +39,19 @@ class VideoAnalyzerRepository(
         private const val TAG = "VideoAnalyzer"
     }
 
+    /** Hit the provider's /v1/models endpoint and return the model ids. */
+    suspend fun fetchModels(baseUrl: String, apiKey: String): List<String> =
+        withContext(Dispatchers.IO) {
+            val normalized = NetworkModule.normalizeBaseUrl(baseUrl)
+            val url = "$normalized/v1/models"
+            val auth = NetworkModule.bearerHeader(apiKey)
+            Log.d(TAG, "[fetchModels] GET $url")
+            val resp = openAi.listModels(url, auth)
+            val ids = resp.allIds()
+            Log.d(TAG, "[fetchModels] returned ${ids.size} model ids")
+            ids
+        }
+
     // ---------------------------------------------------------------------
     // Lightweight helpers used by the ViewModel for orchestration
     // ---------------------------------------------------------------------
@@ -79,7 +92,7 @@ class VideoAnalyzerRepository(
 
         // ---- prep: optional downscale ----
         var downscaledFile: File? = null
-        val (bytes, mime): Pair<ByteArray, String> = try {
+        val (bytes, mime) = try {
             if (maxResolution != MaxResolution.OFF) {
                 Log.d(TAG, "[analyzeVideo] downscaling → ${maxResolution.label}")
                 downscaledFile = VideoUtils.downscaleVideo(

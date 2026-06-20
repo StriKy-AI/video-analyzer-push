@@ -165,6 +165,9 @@ object VideoUtils {
         targetHeight: Int?,
     ): File? {
         if (targetHeight == null) return null
+        // Capture the non-null height in a local val so the smart cast survives
+        // being captured by the suspendCancellableCoroutine lambda below.
+        val height: Int = targetHeight
 
         val outDir = File(context.cacheDir, "downscaled").apply { mkdirs() }
         val outFile = File(outDir, "vid_${System.currentTimeMillis()}.mp4")
@@ -190,11 +193,13 @@ object VideoUtils {
                 .addListener(listener)
                 .build()
 
+            // Use positional args — Media3's Effects class is a Java class and the
+            // parameter names are not always preserved at the Kotlin call site.
             val edited = EditedMediaItem.Builder(MediaItem.fromUri(src))
                 .setEffects(
                     Effects(
-                        audioProcessors = emptyList(),
-                        videoEffects = listOf(Presentation.createForHeight(targetHeight)),
+                        emptyList(),                                            // audioProcessors
+                        listOf(Presentation.createForHeight(height)),           // videoEffects
                     ),
                 )
                 .build()
