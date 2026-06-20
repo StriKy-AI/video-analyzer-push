@@ -13,6 +13,12 @@ import java.util.concurrent.TimeUnit
  * baseUrl on the Retrofit instance because users can change the endpoint at
  * runtime — every call passes the absolute URL via the `@Url` parameter on
  * the service methods.
+ *
+ * Two custom interceptors are installed:
+ *  - [UploadProgressInterceptor] — always on; reports byte counts to the UI
+ *  - [GzipRequestInterceptor]    — gated by [gzipInterceptor.enabled], which
+ *                                  the SettingsViewModel flips when the user
+ *                                  toggles "Gzip compression" in Settings
  */
 object NetworkModule {
 
@@ -20,15 +26,21 @@ object NetworkModule {
         .add(KotlinJsonAdapterFactory())
         .build()
 
+    /** Exposed so SettingsViewModel can flip it when the user toggles gzip. */
+    val gzipInterceptor = GzipRequestInterceptor(enabled = false)
+
     private val okHttp: OkHttpClient = OkHttpClient.Builder()
         .connectTimeout(30, TimeUnit.SECONDS)
-        .readTimeout(120, TimeUnit.SECONDS)
-        .writeTimeout(120, TimeUnit.SECONDS)
+        .readTimeout(180, TimeUnit.SECONDS) // longer — video upload + inference can take minutes
+        .writeTimeout(180, TimeUnit.SECONDS)
         .addInterceptor(
             HttpLoggingInterceptor().apply {
                 level = HttpLoggingInterceptor.Level.BASIC
             }
         )
+        // Order matters: gzip wraps the body, progress wraps the (possibly-gzipped) body.
+        .addInterceptor(gzipInterceptor)
+        .addInterceptor(UploadProgressInterceptor())
         .build()
 
     private val retrofit: Retrofit = Retrofit.Builder()

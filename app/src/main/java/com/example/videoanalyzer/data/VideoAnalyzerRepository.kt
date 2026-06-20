@@ -12,22 +12,20 @@ import com.example.videoanalyzer.network.ImageUrl
 import com.example.videoanalyzer.network.NetworkModule
 import com.example.videoanalyzer.network.OpenAiCompatibleService
 import com.example.videoanalyzer.network.VideoUrl
+import com.example.videoanalyzer.util.UploadProgressBus
 import com.example.videoanalyzer.util.VideoUtils
+import com.example.videoanalyzer.util.VideoUtils.MaxResolution
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import java.io.File
 import java.io.IOException
 
 /**
  * Single entry point for talking to the configured provider.
  *
- * Strategy for "send a video to a chat model":
- *  1. Read the entire video as bytes from the user-picked Uri.
- *  2. Base64-encode and embed as a `data:video/...;base64,...` URL inside a
- *     `video_url` content part. Moonshot / Kimi accept this shape directly.
- *  3. POST to /v1/chat/completions using the standard OpenAI request envelope.
- *
- * If the chosen provider does not understand `video_url`, the user can switch
- * to a vision-capable model OR pick a smaller clip — see README "Troubleshooting".
+ * The ViewModel is responsible for orchestration — querying file size for
+ * the warning dialog, calling [analyzeVideo] after user confirmation, etc.
+ * This class is concerned only with: read bytes, optionally downscale, POST.
  */
 class VideoAnalyzerRepository(
     private val context: Context,
@@ -41,22 +39,31 @@ class VideoAnalyzerRepository(
         private const val TAG = "VideoAnalyzer"
     }
 
-    /** Hit the provider's /v1/models endpoint and return the model ids. */
-    suspend fun fetchModels(baseUrl: String, apiKey: String): List<String> =
-        withContext(Dispatchers.IO) {
-            val normalized = NetworkModule.normalizeBaseUrl(baseUrl)
-            val url = "$normalized/v1/models"
-            val auth = NetworkModule.bearerHeader(apiKey)
-            Log.d(TAG, "[fetchModels] GET $url")
-            val resp = openAi.listModels(url, auth)
-            val ids = resp.allIds()
-            Log.d(TAG, "[fetchModels] returned ${ids.size} model ids")
-            ids
-        }
+    // ---------------------------------------------------------------------
+    // Lightweight helpers used by the ViewModel for orchestration
+    // ---------------------------------------------------------------------
 
     /**
-     * Send [videoUri] + [question] to the configured provider and return the
-     * model's text answer. Throws [ApiException] on transport / API errors.
+     * Fast metadata-only size query — does NOT read the file. Returns null
+     * if the provider doesn't expose a size (e.g. some cloud-backed URIs).
+     */
+    fun querySize(uri: Uri): Long? = VideoUtils.querySizeBytes(context, uri)
+
+    // ---------------------------------------------------------------------
+    // Main upload path
+    // ---------------------------------------------------------------------
+
+    /**
+     * Send [videoUri] + [question] to the configured provider and return
+     * the model's text answer.
+     *
+     * If [maxResolution] is anything other than [MaxResolution.OFF], the
+     * video is re-encoded locally via Media3 Transformer to that height
+     * before upload. The downscaled file lives in the app's cache dir and
+     * is deleted in a finally block after upload.
+     *
+     * Throws [ApiException] on transport / API errors, [IOException] on
+     * network failures.
      */
     suspend fun analyzeVideo(
         baseUrl: String,
@@ -64,61 +71,91 @@ class VideoAnalyzerRepository(
         model: String,
         videoUri: Uri,
         question: String,
+        maxResolution: MaxResolution = MaxResolution.OFF,
     ): String = withContext(Dispatchers.IO) {
         val normalized = NetworkModule.normalizeBaseUrl(baseUrl)
         val url = "$normalized/v1/chat/completions"
         val auth = NetworkModule.bearerHeader(apiKey)
 
-        val (bytes, mime) = VideoUtils.readBytesAndMime(context, videoUri)
-        val dataUrl = "data:$mime;base64,${android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP)}"
+        // ---- prep: optional downscale ----
+        var downscaledFile: File? = null
+        val (bytes, mime): Pair<ByteArray, String> = try {
+            if (maxResolution != MaxResolution.OFF) {
+                Log.d(TAG, "[analyzeVideo] downscaling → ${maxResolution.label}")
+                downscaledFile = VideoUtils.downscaleVideo(
+                    context = context,
+                    src = videoUri,
+                    targetHeight = maxResolution.heightPx,
+                )
+                if (downscaledFile != null && downscaledFile.exists()) {
+                    downscaledFile.readBytes() to "video/mp4"
+                } else {
+                    Log.w(TAG, "[analyzeVideo] downscale returned null — falling back to original")
+                    VideoUtils.readBytesAndMime(context, videoUri)
+                }
+            } else {
+                VideoUtils.readBytesAndMime(context, videoUri)
+            }
+        } catch (e: Throwable) {
+            Log.e(TAG, "[analyzeVideo] downscale failed: ${e.message} — falling back to original", e)
+            downscaledFile?.delete()
+            downscaledFile = null
+            VideoUtils.readBytesAndMime(context, videoUri)
+        }
 
-        val request = ChatCompletionRequest(
-            model = model,
-            messages = listOf(
-                ChatMessage(
-                    role = "user",
-                    content = listOf(
-                        ContentPart(
-                            type = "text",
-                            text = question.ifBlank { "Describe what's happening in this video." },
+        try {
+            val dataUrl = "data:$mime;base64,${android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP)}"
+
+            val request = ChatCompletionRequest(
+                model = model,
+                messages = listOf(
+                    ChatMessage(
+                        role = "user",
+                        content = listOf(
+                            ContentPart(
+                                type = "text",
+                                text = question.ifBlank { "Describe what's happening in this video." },
+                            ),
+                            ContentPart(type = "video_url", videoUrl = VideoUrl(dataUrl)),
                         ),
-                        ContentPart(type = "video_url", videoUrl = VideoUrl(dataUrl)),
                     ),
                 ),
-            ),
-        )
-
-        logRequest(
-            op = "analyzeVideo",
-            method = "POST",
-            url = url,
-            request = request,
-            videoBytes = bytes.size,
-            mime = mime,
-            model = model,
-        )
-
-        val response: ChatCompletionResponse = try {
-            chat.chatCompletion(url, auth, body = request)
-        } catch (e: retrofit2.HttpException) {
-            val errorBody = e.response()?.errorBody()?.string().orEmpty()
-            Log.e(TAG, "[analyzeVideo] HTTP ${e.code()} ${e.message()} | body: $errorBody")
-            throw ApiException(
-                code = e.code(),
-                message = "HTTP ${e.code()} ${e.message()}\n$errorBody",
             )
-        } catch (e: IOException) {
-            Log.e(TAG, "[analyzeVideo] network error: ${e.message}", e)
-            throw ApiException(code = -1, message = "Network error: ${e.message}", cause = e)
-        }
 
-        response.error?.let {
-            Log.e(TAG, "[analyzeVideo] API error: ${it.message}")
-            throw ApiException(code = -2, message = it.message)
+            logRequest(
+                op = "analyzeVideo",
+                method = "POST",
+                url = url,
+                request = request,
+                videoBytes = bytes.size,
+                mime = mime,
+                model = model,
+            )
+
+            val response: ChatCompletionResponse = try {
+                chat.chatCompletion(url, auth, body = request)
+            } catch (e: retrofit2.HttpException) {
+                val errorBody = e.response()?.errorBody()?.string().orEmpty()
+                Log.e(TAG, "[analyzeVideo] HTTP ${e.code()} ${e.message()} | body: $errorBody")
+                throw ApiException(
+                    code = e.code(),
+                    message = "HTTP ${e.code()} ${e.message()}\n$errorBody",
+                )
+            } catch (e: IOException) {
+                Log.e(TAG, "[analyzeVideo] network error: ${e.message}", e)
+                throw ApiException(code = -1, message = "Network error: ${e.message}", cause = e)
+            }
+
+            response.error?.let {
+                Log.e(TAG, "[analyzeVideo] API error: ${it.message}")
+                throw ApiException(code = -2, message = it.message)
+            }
+            val text = response.extractText()
+            Log.d(TAG, "[analyzeVideo] ✓ received ${text.length} chars of response text")
+            text
+        } finally {
+            downscaledFile?.delete()
         }
-        val text = response.extractText()
-        Log.d(TAG, "[analyzeVideo] ✓ received ${text.length} chars of response text")
-        text
     }
 
     /**
@@ -162,7 +199,7 @@ class VideoAnalyzerRepository(
             method = "POST",
             url = url,
             request = request,
-            videoBytes = frames.size * 80_000, // rough estimate, not exact
+            videoBytes = frames.size * 80_000,
             mime = "image/jpeg",
             model = model,
         )
@@ -189,9 +226,7 @@ class VideoAnalyzerRepository(
 
     /**
      * Emits a single logcat block with everything needed to diagnose an API
-     * request without dumping the multi-MB base64 payload. The body preview
-     * keeps the JSON structure but replaces the encoded video / frame blobs
-     * with `[<size> B redacted]` markers.
+     * request without dumping the multi-MB base64 payload.
      */
     private fun logRequest(
         op: String,
@@ -206,7 +241,8 @@ class VideoAnalyzerRepository(
         Log.d(TAG, "[$op] method  : $method")
         Log.d(TAG, "[$op] url     : $url")
         Log.d(TAG, "[$op] model   : $model")
-        Log.d(TAG, "[$op] payload : $videoBytes bytes ($mime)")
+        Log.d(TAG, "[$op] payload : ${VideoUtils.formatBytes(videoBytes.toLong())} ($mime)")
+        Log.d(TAG, "[$op] gzip    : ${NetworkModule.gzipInterceptor.enabled}")
 
         val redacted = request.copy(
             messages = request.messages.map { msg ->

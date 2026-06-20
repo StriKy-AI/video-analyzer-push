@@ -7,10 +7,15 @@ import androidx.lifecycle.viewModelScope
 import com.example.videoanalyzer.VideoAnalyzerApp
 import com.example.videoanalyzer.data.PreferencesRepository
 import com.example.videoanalyzer.data.VideoAnalyzerRepository
+import com.example.videoanalyzer.util.UploadProgressBus
+import com.example.videoanalyzer.util.VideoUtils.MaxResolution
+import com.example.videoanalyzer.util.VideoUtils.WarnThreshold
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 
 class HomeViewModel(
@@ -25,15 +30,28 @@ class HomeViewModel(
         val selectedModel: String = "",
         val videoUri: Uri? = null,
         val videoDisplayName: String? = null,
+        val videoSizeBytes: Long? = null,
         val question: String = "",
         val answer: String? = null,
         val isAnalyzing: Boolean = false,
-        val error: String? = null,
         val useFrames: Boolean = false,
+        val maxResolution: MaxResolution = MaxResolution.RES_720,
+        val warnThreshold: WarnThreshold = WarnThreshold.OVER_20MB,
+        val error: String? = null,
+        /** Non-null when we're waiting for the user to confirm a large upload. */
+        val pendingSizeBytes: Long? = null,
     )
 
     private val _state = MutableStateFlow(UiState())
     val state: StateFlow<UiState> = _state.asStateFlow()
+
+    /** Live upload progress driven by [UploadProgressBus] — read by the UI. */
+    val uploadProgress: StateFlow<UploadProgressBus.Snapshot> =
+        UploadProgressBus.state.stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(5_000),
+            initialValue = UploadProgressBus.Snapshot(),
+        )
 
     init {
         viewModelScope.launch {
@@ -42,12 +60,21 @@ class HomeViewModel(
                 apiKey = prefs.apiKey.first(),
                 selectedModel = prefs.selectedModel.first(),
                 models = prefs.cachedModels.first(),
+                maxResolution = prefs.maxResolution.first(),
+                warnThreshold = prefs.warnThreshold.first(),
             )
         }
     }
 
     fun onVideoPicked(uri: Uri?, displayName: String?) {
-        _state.value = _state.value.copy(videoUri = uri, videoDisplayName = displayName, answer = null)
+        _state.value = _state.value.copy(
+            videoUri = uri,
+            videoDisplayName = displayName,
+            videoSizeBytes = uri?.let { repo.querySize(it) },
+            answer = null,
+            error = null,
+            pendingSizeBytes = null,
+        )
     }
 
     fun onQuestionChange(value: String) {
@@ -61,6 +88,11 @@ class HomeViewModel(
 
     fun onUseFramesToggle(value: Boolean) {
         _state.value = _state.value.copy(useFrames = value)
+    }
+
+    fun onMaxResolutionChange(value: MaxResolution) {
+        _state.value = _state.value.copy(maxResolution = value)
+        viewModelScope.launch { prefs.setMaxResolution(value) }
     }
 
     fun refreshModels() {
@@ -78,10 +110,14 @@ class HomeViewModel(
         }
     }
 
-    fun analyze() {
+    /**
+     * Entry point when the user taps Analyze. If the file size is known and
+     * exceeds the user's warning threshold, set [UiState.pendingSizeBytes] so
+     * the UI shows the confirmation dialog. Otherwise go straight to upload.
+     */
+    fun onAnalyzeClicked() {
         val s = _state.value
-        val uri = s.videoUri
-        if (uri == null) {
+        val uri = s.videoUri ?: run {
             _state.value = s.copy(error = "Pick a video first.")
             return
         }
@@ -89,7 +125,39 @@ class HomeViewModel(
             _state.value = s.copy(error = "No model selected — go to Settings to pick one.")
             return
         }
+        // If we don't know the size, fall back to reading it. If we still
+        // don't know, just send — better to upload than to refuse.
+        val size = s.videoSizeBytes ?: repo.querySize(uri)
+        _state.value = _state.value.copy(videoSizeBytes = size)
+
+        val threshold = s.warnThreshold
+        if (size != null && threshold.minBytes != null && size >= threshold.minBytes) {
+            _state.value = s.copy(pendingSizeBytes = size)
+        } else {
+            startUpload()
+        }
+    }
+
+    /** Called when the user taps "Send anyway" in the confirmation dialog. */
+    fun confirmUpload() {
+        _state.value = _state.value.copy(pendingSizeBytes = null)
+        startUpload()
+    }
+
+    /** Called when the user taps "Cancel" in the confirmation dialog. */
+    fun cancelUpload() {
+        _state.value = _state.value.copy(pendingSizeBytes = null)
+    }
+
+    fun clearError() {
+        _state.value = _state.value.copy(error = null)
+    }
+
+    private fun startUpload() {
+        val s = _state.value
+        val uri = s.videoUri ?: return
         _state.value = s.copy(isAnalyzing = true, error = null, answer = null)
+
         viewModelScope.launch {
             try {
                 val result = if (s.useFrames) {
@@ -107,6 +175,7 @@ class HomeViewModel(
                         model = s.selectedModel,
                         videoUri = uri,
                         question = s.question,
+                        maxResolution = s.maxResolution,
                     )
                 }
                 _state.value = _state.value.copy(isAnalyzing = false, answer = result)
@@ -122,10 +191,6 @@ class HomeViewModel(
                 )
             }
         }
-    }
-
-    fun clearError() {
-        _state.value = _state.value.copy(error = null)
     }
 
     companion object {

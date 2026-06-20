@@ -27,6 +27,8 @@ import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.SmartToy
+import androidx.compose.material.icons.filled.SwapVert
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.AssistChip
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
@@ -39,13 +41,14 @@ import androidx.compose.material3.ExposedDropdownMenuDefaults
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
-import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
@@ -56,10 +59,12 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
-import com.example.videoanalyzer.R
+import com.example.videoanalyzer.util.VideoUtils
+import com.example.videoanalyzer.util.VideoUtils.MaxResolution
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -69,14 +74,15 @@ fun HomeScreen(
     vm: HomeViewModel = viewModel(factory = HomeViewModel.factory()),
 ) {
     val state by vm.state.collectAsStateWithLifecycle()
+    val progress by vm.uploadProgress.collectAsStateWithLifecycle()
     val context = LocalContext.current
     var modelDropdownExpanded by remember { mutableStateOf(false) }
+    var resDropdownExpanded by remember { mutableStateOf(false) }
 
     val pickVideo = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.PickVisualMedia(),
     ) { uri: Uri? ->
         if (uri != null) {
-            // Persist read permission so the URI stays usable after process death.
             try {
                 context.contentResolver.takePersistableUriPermission(
                     uri,
@@ -86,6 +92,45 @@ fun HomeScreen(
             val name = queryDisplayName(context, uri) ?: "video"
             vm.onVideoPicked(uri, name)
         }
+    }
+
+    // ---- Size confirmation dialog ----
+    if (state.pendingSizeBytes != null) {
+        val sizeBytes = state.pendingSizeBytes!!
+        val pretty = VideoUtils.formatBytes(sizeBytes)
+        AlertDialog(
+            onDismissRequest = { vm.cancelUpload() },
+            title = { Text("Large upload") },
+            text = {
+                Column {
+                    Text(
+                        "This video is $pretty. Uploading will send the full file " +
+                            "to your configured API provider over the network.",
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    if (state.maxResolution != MaxResolution.OFF) {
+                        Text(
+                            "Local downscale is enabled (${state.maxResolution.label}), so the " +
+                                "actual upload may be smaller after re-encoding.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    } else {
+                        Text(
+                            "Tip: enable a max upload resolution in Settings to reduce payload size.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { vm.confirmUpload() }) { Text("Send anyway") }
+            },
+            dismissButton = {
+                TextButton(onClick = { vm.cancelUpload() }) { Text("Cancel") }
+            },
+        )
     }
 
     Scaffold(
@@ -221,6 +266,14 @@ fun HomeScreen(
                             "Selected: ${state.videoDisplayName}",
                             style = MaterialTheme.typography.bodyMedium,
                         )
+                        state.videoSizeBytes?.let { size ->
+                            Text(
+                                "Size: ${VideoUtils.formatBytes(size)}",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                fontFamily = FontFamily.Monospace,
+                            )
+                        }
                         Row(
                             horizontalArrangement = Arrangement.spacedBy(8.dp),
                         ) {
@@ -242,9 +295,7 @@ fun HomeScreen(
 
                     HorizontalDivider()
 
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
                         Column(modifier = Modifier.weight(1f)) {
                             Text("Use frames instead of raw video", style = MaterialTheme.typography.bodyMedium)
                             Text(
@@ -257,6 +308,66 @@ fun HomeScreen(
                             checked = state.useFrames,
                             onCheckedChange = vm::onUseFramesToggle,
                         )
+                    }
+                }
+            }
+
+            // --- Max resolution picker (visible when not in frames mode) ---
+            if (!state.useFrames) {
+                Card(
+                    colors = CardDefaults.cardColors(
+                        containerColor = MaterialTheme.colorScheme.surfaceVariant,
+                    ),
+                    shape = RoundedCornerShape(16.dp),
+                ) {
+                    Column(
+                        modifier = Modifier.padding(16.dp),
+                        verticalArrangement = Arrangement.spacedBy(12.dp),
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            Icon(Icons.Filled.SwapVert, contentDescription = null)
+                            Text(
+                                "Max upload resolution",
+                                style = MaterialTheme.typography.titleMedium,
+                                modifier = Modifier.weight(1f),
+                            )
+                        }
+                        Text(
+                            "Re-encode locally before upload. Smaller files = faster + cheaper.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        ExposedDropdownMenuBox(
+                            expanded = resDropdownExpanded,
+                            onExpandedChange = { resDropdownExpanded = !resDropdownExpanded },
+                        ) {
+                            OutlinedTextField(
+                                value = state.maxResolution.label,
+                                onValueChange = {},
+                                readOnly = true,
+                                trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = resDropdownExpanded) },
+                                modifier = Modifier
+                                    .menuAnchor()
+                                    .fillMaxWidth(),
+                            )
+                            ExposedDropdownMenu(
+                                expanded = resDropdownExpanded,
+                                onDismissRequest = { resDropdownExpanded = false },
+                            ) {
+                                MaxResolution.values().forEach { res ->
+                                    DropdownMenuItem(
+                                        text = { Text(res.label) },
+                                        onClick = {
+                                            vm.onMaxResolutionChange(res)
+                                            resDropdownExpanded = false
+                                        },
+                                    )
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -275,7 +386,7 @@ fun HomeScreen(
             )
 
             Button(
-                onClick = vm::analyze,
+                onClick = { vm.onAnalyzeClicked() },
                 enabled = !state.isAnalyzing && state.videoUri != null && state.selectedModel.isNotBlank(),
                 modifier = Modifier.fillMaxWidth(),
             ) {
@@ -286,11 +397,38 @@ fun HomeScreen(
                         color = MaterialTheme.colorScheme.onPrimary,
                     )
                     Spacer(Modifier.width(8.dp))
-                    Text("Analyzing…")
+                    Text("Working…")
                 } else {
                     Icon(Icons.Filled.AutoAwesome, contentDescription = null)
                     Spacer(Modifier.width(8.dp))
                     Text("Analyze Video")
+                }
+            }
+
+            // --- Live upload progress ---
+            if (progress.isActive && progress.totalBytes > 0L) {
+                Card(
+                    colors = CardDefaults.cardColors(
+                        containerColor = MaterialTheme.colorScheme.surface,
+                    ),
+                    shape = RoundedCornerShape(12.dp),
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(12.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
+                        Text(
+                            "Uploading… ${VideoUtils.formatBytes(progress.sentBytes)} / ${VideoUtils.formatBytes(progress.totalBytes)}",
+                            style = MaterialTheme.typography.bodySmall,
+                            fontFamily = FontFamily.Monospace,
+                        )
+                        LinearProgressIndicator(
+                            progress = { progress.fraction },
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                    }
                 }
             }
 

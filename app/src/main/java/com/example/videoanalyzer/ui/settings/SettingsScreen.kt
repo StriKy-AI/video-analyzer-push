@@ -15,9 +15,12 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.Compress
 import androidx.compose.material.icons.filled.DeleteForever
+import androidx.compose.material.icons.filled.HighQuality
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Save
+import androidx.compose.material.icons.filled.WarningAmber
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -26,12 +29,14 @@ import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExposedDropdownMenuBox
 import androidx.compose.material3.ExposedDropdownMenuDefaults
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
@@ -48,6 +53,8 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.example.videoanalyzer.util.VideoUtils.MaxResolution
+import com.example.videoanalyzer.util.VideoUtils.WarnThreshold
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -58,6 +65,8 @@ fun SettingsScreen(
 ) {
     val state by vm.state.collectAsStateWithLifecycle()
     var dropdownExpanded by remember { mutableStateOf(false) }
+    var resExpanded by remember { mutableStateOf(false) }
+    var warnExpanded by remember { mutableStateOf(false) }
 
     Scaffold(
         topBar = {
@@ -83,6 +92,7 @@ fun SettingsScreen(
                 .padding(horizontal = 20.dp, vertical = 16.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp),
         ) {
+            // ---- Provider config ----
             OutlinedTextField(
                 value = state.baseUrl,
                 onValueChange = vm::onBaseUrlChange,
@@ -169,6 +179,130 @@ fun SettingsScreen(
                 }
             }
 
+            // ---- Upload behavior section ----
+            Card(
+                colors = CardDefaults.cardColors(
+                    containerColor = MaterialTheme.colorScheme.surfaceVariant,
+                ),
+                shape = RoundedCornerShape(16.dp),
+            ) {
+                Column(
+                    modifier = Modifier.padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp),
+                ) {
+                    Text(
+                        "Upload behavior",
+                        style = MaterialTheme.typography.titleMedium,
+                    )
+
+                    // Max resolution
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        Icon(Icons.Filled.HighQuality, contentDescription = null)
+                        Text("Max upload resolution", style = MaterialTheme.typography.bodyMedium)
+                    }
+                    Text(
+                        "Re-encode the video locally before upload. Smaller = faster + cheaper.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    ExposedDropdownMenuBox(
+                        expanded = resExpanded,
+                        onExpandedChange = { resExpanded = !resExpanded },
+                    ) {
+                        OutlinedTextField(
+                            value = state.maxResolution.label,
+                            onValueChange = {},
+                            readOnly = true,
+                            trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = resExpanded) },
+                            modifier = Modifier
+                                .menuAnchor()
+                                .fillMaxWidth(),
+                        )
+                        ExposedDropdownMenu(
+                            expanded = resExpanded,
+                            onDismissRequest = { resExpanded = false },
+                        ) {
+                            MaxResolution.values().forEach { r ->
+                                DropdownMenuItem(
+                                    text = { Text(r.label) },
+                                    onClick = {
+                                        vm.onMaxResolutionChange(r)
+                                        resExpanded = false
+                                    },
+                                )
+                            }
+                        }
+                    }
+
+                    HorizontalDivider() // resolved import below
+
+                    // Warn threshold
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        Icon(Icons.Filled.WarningAmber, contentDescription = null)
+                        Text("Warn before uploading", style = MaterialTheme.typography.bodyMedium)
+                    }
+                    Text(
+                        "Show a confirmation dialog when the picked video is bigger than the threshold.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    ExposedDropdownMenuBox(
+                        expanded = warnExpanded,
+                        onExpandedChange = { warnExpanded = !warnExpanded },
+                    ) {
+                        OutlinedTextField(
+                            value = state.warnThreshold.label,
+                            onValueChange = {},
+                            readOnly = true,
+                            trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = warnExpanded) },
+                            modifier = Modifier
+                                .menuAnchor()
+                                .fillMaxWidth(),
+                        )
+                        ExposedDropdownMenu(
+                            expanded = warnExpanded,
+                            onDismissRequest = { warnExpanded = false },
+                        ) {
+                            WarnThreshold.values().forEach { t ->
+                                DropdownMenuItem(
+                                    text = { Text(t.label) },
+                                    onClick = {
+                                        vm.onWarnThresholdChange(t)
+                                        warnExpanded = false
+                                    },
+                                )
+                            }
+                        }
+                    }
+
+                    HorizontalDivider()
+
+                    // Gzip toggle
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Filled.Compress, contentDescription = null)
+                        Spacer(Modifier.width(8.dp))
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("Gzip request body", style = MaterialTheme.typography.bodyMedium)
+                            Text(
+                                "Compress the upload. Some providers don't accept Content-Encoding: gzip — turn off if requests fail with 400.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                        Switch(
+                            checked = state.gzipEnabled,
+                            onCheckedChange = vm::onGzipEnabledChange,
+                        )
+                    }
+                }
+            }
+
             Button(
                 onClick = vm::save,
                 enabled = state.baseUrl.isNotBlank() && state.apiKey.isNotBlank() && state.selectedModel.isNotBlank(),
@@ -176,7 +310,7 @@ fun SettingsScreen(
             ) {
                 Icon(Icons.Filled.Save, contentDescription = null)
                 Spacer(Modifier.width(8.dp))
-                Text("Save changes")
+                Text("Save provider changes")
             }
 
             if (state.error != null) {
@@ -206,6 +340,7 @@ fun SettingsScreen(
 
             Spacer(Modifier.size(8.dp))
 
+            // ---- Danger zone ----
             Card(
                 colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer),
                 shape = RoundedCornerShape(16.dp),
