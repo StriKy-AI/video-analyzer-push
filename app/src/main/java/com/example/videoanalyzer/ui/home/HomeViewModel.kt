@@ -50,6 +50,14 @@ class HomeViewModel(
 
     companion object {
         private const val TAG = "VideoAnalyzer"
+
+        fun factory(): ViewModelProvider.Factory = object : ViewModelProvider.Factory {
+            @Suppress("UNCHECKED_CAST")
+            override fun <T : ViewModel> create(modelClass: Class<T>): T {
+                val app = VideoAnalyzerApp.get()
+                return HomeViewModel(app.preferences, app.repository) as T
+            }
+        }
     }
 
     private val _state = MutableStateFlow(UiState())
@@ -297,14 +305,4 @@ class HomeViewModel(
         cachedVideoMime = mime
         return bytes to mime
     }
-
-    companion object {
-        fun factory(): ViewModelProvider.Factory = object : ViewModelProvider.Factory {
-            @Suppress("UNCHECKED_CAST")
-            override fun <T : ViewModel> create(modelClass: Class<T>): T {
-                val app = VideoAnalyzerApp.get()
-                return HomeViewModel(app.preferences, app.repository) as T
-            }
-        }
-    }
-}
+}}
