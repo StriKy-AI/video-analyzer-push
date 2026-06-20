@@ -1,12 +1,17 @@
 package com.example.videoanalyzer.ui.home
 
 import android.net.Uri
+import android.util.Base64
+import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewModelScope
 import com.example.videoanalyzer.VideoAnalyzerApp
 import com.example.videoanalyzer.data.PreferencesRepository
 import com.example.videoanalyzer.data.VideoAnalyzerRepository
+import com.example.videoanalyzer.network.ChatMessage
+import com.example.videoanalyzer.network.ContentPart
+import com.example.videoanalyzer.network.VideoUrl
 import com.example.videoanalyzer.util.UploadProgressBus
 import com.example.videoanalyzer.util.VideoUtils.MaxResolution
 import com.example.videoanalyzer.util.VideoUtils.WarnThreshold
@@ -31,27 +36,39 @@ class HomeViewModel(
         val videoUri: Uri? = null,
         val videoDisplayName: String? = null,
         val videoSizeBytes: Long? = null,
-        val question: String = "",
-        val answer: String? = null,
-        val isAnalyzing: Boolean = false,
-        val useFrames: Boolean = false,
         val maxResolution: MaxResolution = MaxResolution.RES_720,
         val warnThreshold: WarnThreshold = WarnThreshold.OVER_20MB,
+        val chatHistory: List<ChatItem> = emptyList(),
+        val pendingMessage: String = "",
+        val isSending: Boolean = false,
         val error: String? = null,
-        /** Non-null when we're waiting for the user to confirm a large upload. */
+        /** Non-null when waiting for user to confirm a large upload. */
         val pendingSizeBytes: Long? = null,
+        /** Non-null when user typed a message but hasn't pressed send yet. */
+        val pendingFirstSendText: String? = null,
     )
+
+    companion object {
+        private const val TAG = "VideoAnalyzer"
+    }
 
     private val _state = MutableStateFlow(UiState())
     val state: StateFlow<UiState> = _state.asStateFlow()
 
-    /** Live upload progress driven by [UploadProgressBus] — read by the UI. */
+    /** Live upload progress driven by [UploadProgressBus]. */
     val uploadProgress: StateFlow<UploadProgressBus.Snapshot> =
         UploadProgressBus.state.stateIn(
             scope = viewModelScope,
             started = SharingStarted.WhileSubscribed(5_000),
             initialValue = UploadProgressBus.Snapshot(),
         )
+
+    /**
+     * In-memory cache of the prepared video bytes for the current chat session.
+     * Cleared when the user picks a different video. Never persisted to disk.
+     */
+    private var cachedVideoBytes: ByteArray? = null
+    private var cachedVideoMime: String? = null
 
     init {
         viewModelScope.launch {
@@ -66,33 +83,41 @@ class HomeViewModel(
         }
     }
 
+    // ---------------------------------------------------------------------
+    // Video lifecycle
+    // ---------------------------------------------------------------------
+
     fun onVideoPicked(uri: Uri?, displayName: String?) {
+        // Picking a new video invalidates the cache and clears the conversation.
+        cachedVideoBytes = null
+        cachedVideoMime = null
         _state.value = _state.value.copy(
             videoUri = uri,
             videoDisplayName = displayName,
             videoSizeBytes = uri?.let { repo.querySize(it) },
-            answer = null,
+            chatHistory = emptyList(),
+            pendingMessage = "",
             error = null,
             pendingSizeBytes = null,
+            pendingFirstSendText = null,
         )
     }
 
-    fun onQuestionChange(value: String) {
-        _state.value = _state.value.copy(question = value)
+    fun onMaxResolutionChange(value: MaxResolution) {
+        // Resolution changed — invalidate the cached bytes; next send will re-prepare.
+        cachedVideoBytes = null
+        cachedVideoMime = null
+        _state.value = _state.value.copy(maxResolution = value)
+        viewModelScope.launch { prefs.setMaxResolution(value) }
     }
+
+    // ---------------------------------------------------------------------
+    // Model / settings
+    // ---------------------------------------------------------------------
 
     fun onModelSelected(model: String) {
         _state.value = _state.value.copy(selectedModel = model)
         viewModelScope.launch { prefs.setSelectedModel(model) }
-    }
-
-    fun onUseFramesToggle(value: Boolean) {
-        _state.value = _state.value.copy(useFrames = value)
-    }
-
-    fun onMaxResolutionChange(value: MaxResolution) {
-        _state.value = _state.value.copy(maxResolution = value)
-        viewModelScope.launch { prefs.setMaxResolution(value) }
     }
 
     fun refreshModels() {
@@ -110,87 +135,167 @@ class HomeViewModel(
         }
     }
 
+    fun clearError() {
+        _state.value = _state.value.copy(error = null)
+    }
+
+    fun clearChat() {
+        _state.value = _state.value.copy(chatHistory = emptyList())
+    }
+
+    // ---------------------------------------------------------------------
+    // Chat send flow
+    // ---------------------------------------------------------------------
+
+    fun onPendingMessageChange(text: String) {
+        _state.value = _state.value.copy(pendingMessage = text)
+    }
+
     /**
-     * Entry point when the user taps Analyze. If the file size is known and
-     * exceeds the user's warning threshold, set [UiState.pendingSizeBytes] so
-     * the UI shows the confirmation dialog. Otherwise go straight to upload.
+     * Entry point for the chat input. If this is the first message in the
+     * conversation, the video will be uploaded — which means we may need to
+     * trigger the size confirmation dialog. Subsequent messages skip that
+     * step and just text-chat.
      */
-    fun onAnalyzeClicked() {
+    fun onSendClicked() {
         val s = _state.value
+        val text = s.pendingMessage.trim()
+        if (text.isEmpty()) return
         val uri = s.videoUri ?: run {
             _state.value = s.copy(error = "Pick a video first.")
             return
         }
         if (s.selectedModel.isBlank()) {
-            _state.value = s.copy(error = "No model selected — go to Settings to pick one.")
+            _state.value = s.copy(error = "No model selected — open Settings.")
             return
         }
-        // If we don't know the size, fall back to reading it. If we still
-        // don't know, just send — better to upload than to refuse.
-        val size = s.videoSizeBytes ?: repo.querySize(uri)
-        _state.value = _state.value.copy(videoSizeBytes = size)
 
-        val threshold = s.warnThreshold
-        if (size != null && threshold.minBytes != null && size >= threshold.minBytes) {
-            _state.value = s.copy(pendingSizeBytes = size)
-        } else {
-            startUpload()
+        val isFirstMessage = s.chatHistory.isEmpty()
+        if (isFirstMessage) {
+            val size = s.videoSizeBytes ?: repo.querySize(uri)
+            _state.value = _state.value.copy(videoSizeBytes = size)
+            val threshold = s.warnThreshold
+            if (size != null && threshold.minBytes != null && size >= threshold.minBytes) {
+                // Park the message text and trigger the confirmation dialog.
+                _state.value = s.copy(pendingFirstSendText = text)
+                return
+            }
         }
+
+        executeSend(text)
     }
 
-    /** Called when the user taps "Send anyway" in the confirmation dialog. */
-    fun confirmUpload() {
-        _state.value = _state.value.copy(pendingSizeBytes = null)
-        startUpload()
+    /** Called when the user taps "Send anyway" in the size confirmation dialog. */
+    fun confirmSend() {
+        val text = _state.value.pendingFirstSendText
+        _state.value = _state.value.copy(pendingFirstSendText = null)
+        if (!text.isNullOrBlank()) executeSend(text)
     }
 
-    /** Called when the user taps "Cancel" in the confirmation dialog. */
-    fun cancelUpload() {
-        _state.value = _state.value.copy(pendingSizeBytes = null)
+    /** Called when the user taps "Cancel" in the size confirmation dialog. */
+    fun cancelSend() {
+        _state.value = _state.value.copy(pendingFirstSendText = null)
     }
 
-    fun clearError() {
-        _state.value = _state.value.copy(error = null)
-    }
-
-    private fun startUpload() {
+    /**
+     * Build the API message list and POST it. The video is attached only to
+     * the very first user message; everything else rides on conversational
+     * context.
+     */
+    private fun executeSend(text: String) {
         val s = _state.value
         val uri = s.videoUri ?: return
-        _state.value = s.copy(isAnalyzing = true, error = null, answer = null)
+        val userItem = ChatItem(role = ChatRole.USER, text = text)
+        val newHistory = s.chatHistory + userItem
+        _state.value = s.copy(
+            chatHistory = newHistory,
+            pendingMessage = "",
+            isSending = true,
+            error = null,
+        )
 
         viewModelScope.launch {
             try {
-                val result = if (s.useFrames) {
-                    repo.analyzeVideoByFrames(
-                        baseUrl = s.baseUrl,
-                        apiKey = s.apiKey,
-                        model = s.selectedModel,
-                        videoUri = uri,
-                        question = s.question,
-                    )
-                } else {
-                    repo.analyzeVideo(
-                        baseUrl = s.baseUrl,
-                        apiKey = s.apiKey,
-                        model = s.selectedModel,
-                        videoUri = uri,
-                        question = s.question,
-                        maxResolution = s.maxResolution,
-                    )
-                }
-                _state.value = _state.value.copy(isAnalyzing = false, answer = result)
-            } catch (e: VideoAnalyzerRepository.ApiException) {
+                val messages = buildApiMessages(uri, newHistory)
+                val response = repo.sendChat(
+                    baseUrl = s.baseUrl,
+                    apiKey = s.apiKey,
+                    model = s.selectedModel,
+                    messages = messages,
+                )
+                val assistantItem = ChatItem(role = ChatRole.ASSISTANT, text = response)
                 _state.value = _state.value.copy(
-                    isAnalyzing = false,
-                    error = e.message ?: "Analysis failed.",
+                    chatHistory = newHistory + assistantItem,
+                    isSending = false,
+                )
+            } catch (e: VideoAnalyzerRepository.ApiException) {
+                Log.e(TAG, "[chat] API error: ${e.message}")
+                _state.value = _state.value.copy(
+                    isSending = false,
+                    error = e.message ?: "API error.",
                 )
             } catch (e: Throwable) {
+                Log.e(TAG, "[chat] error: ${e.message}", e)
                 _state.value = _state.value.copy(
-                    isAnalyzing = false,
-                    error = e.message ?: e::class.simpleName ?: "Analysis failed.",
+                    isSending = false,
+                    error = e.message ?: e::class.simpleName ?: "Send failed.",
                 )
             }
         }
+    }
+
+    /**
+     * Translate the chat history into the wire-format list of [ChatMessage]s.
+     * The first user message gets the video attached as a `video_url` part;
+     * everything else is plain text.
+     */
+    private suspend fun buildApiMessages(
+        uri: Uri,
+        history: List<ChatItem>,
+    ): List<ChatMessage> {
+        val isFirstUserMessage = history.indexOfFirst { it.role == ChatRole.USER }
+        return history.mapIndexed { idx, item ->
+            when (item.role) {
+                ChatRole.ASSISTANT -> ChatMessage(
+                    role = "assistant",
+                    content = listOf(ContentPart(type = "text", text = item.text)),
+                )
+                ChatRole.USER -> {
+                    if (idx == isFirstUserMessage) {
+                        val (bytes, mime) = prepareVideoBytes(uri)
+                        val dataUrl = "data:$mime;base64,${Base64.encodeToString(bytes, Base64.NO_WRAP)}"
+                        ChatMessage(
+                            role = "user",
+                            content = listOf(
+                                ContentPart(type = "text", text = item.text),
+                                ContentPart(type = "video_url", videoUrl = VideoUrl(dataUrl)),
+                            ),
+                        )
+                    } else {
+                        ChatMessage(
+                            role = "user",
+                            content = listOf(ContentPart(type = "text", text = item.text)),
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Read + downscale the video once per session and cache the bytes. Skips
+     * the heavy work for follow-up messages.
+     */
+    private suspend fun prepareVideoBytes(uri: Uri): Pair<ByteArray, String> {
+        cachedVideoBytes?.let { bytes ->
+            cachedVideoMime?.let { mime -> return bytes to mime }
+        }
+        val maxRes = _state.value.maxResolution
+        Log.d(TAG, "[chat] preparing video bytes (maxRes=${maxRes.label})")
+        val (bytes, mime) = repo.readVideoBytes(uri, maxRes)
+        cachedVideoBytes = bytes
+        cachedVideoMime = mime
+        return bytes to mime
     }
 
     companion object {
